@@ -417,7 +417,9 @@ const uint8_t* DNSResolver::parse_answer(const uint8_t *pkt, int len, const uint
             type == DNS_NS_RECORD ||
             type == DNS_CNAME_RECORD) {
 
-            fetch(pkt, p, len, name, sizeof(name) - 1);
+			const uint8_t *poff = type == DNS_MX_RECORD ? &p[2] : p;
+
+            fetch(pkt, poff, len, name, sizeof(name) - 1);
             rec.addr = std::string(name);
 
             std::transform(rec.addr.begin(), rec.addr.end(), rec.addr.begin(), ::tolower);
