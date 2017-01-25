@@ -44,9 +44,9 @@ typedef unsigned int uint32_t;
 #endif /* _WIN32 */
 
 #include "tadns.h"
+#include "tadns_common.h"
 
 #define DNS_MAX             1025    /* Maximum host name          */
-#define DNS_PACKET_LEN      2048    /* Buffer size for DNS packet */
 #define MAX_CACHE_ENTRIES   (1<<14) /* Dont cache more than that  */
 #define CACHE_PURGE_STEP    (1<<12) /* Dont cache more than that  */
 
@@ -125,8 +125,6 @@ protected:
     void queue(unsigned niter, void *ctx, const char *name, Query *dep, enum dns_record_type qtype,
                dns_callback_t callback, struct sockaddr * dnss);
     Query *createQuery(unsigned niter, void *ctx, const char *name, enum dns_record_type qtype, dns_callback_t callback);
-    const uint8_t* parse_answer(const uint8_t *pkt, int len, const uint8_t *p,
-                                unsigned count, std::vector<struct dns_record> &r, enum dns_response_type resp);
     std::string getNSipaddr(unsigned niter, std::vector<struct dns_record> recs, std::string dom,
             void *ctx, std::string name, enum dns_record_type qtype, dns_callback_t callback);
     void resolveInt(unsigned niter, void *context, std::string host, enum dns_record_type type, dns_callback_t callback);
@@ -146,53 +144,6 @@ protected:
     /* Cached queries */
     std::map< std::pair<std::string, uint16_t>, cache_entry> cached; 
 };
-
-/*
- * DNS network packet
- */
-struct header {
-    uint16_t tid;       /* Transaction ID        */
-    uint16_t flags;     /* Flags            */
-    uint16_t nqueries;  /* Questions            */
-    uint16_t nanswers;  /* Answers            */
-    uint16_t nauth;     /* Authority PRs        */
-    uint16_t nother;    /* Other PRs            */
-    uint8_t  data[];    /* Data, variable length    */
-};
-
-/*
- * Fetch name from DNS packet
- */
-static unsigned fetch(const uint8_t *pkt, const uint8_t *s, int pktsiz, char *dst, int dstlen) {
-    const uint8_t *e = pkt + pktsiz;
-    unsigned skip = 0;
-    bool labelj = false;
-    int j, i = 0, n = 0;
-
-    while (*s != 0 && s < e) {
-        if (n > 0)
-            dst[i++] = '.';
-
-        if (i >= dstlen)
-            break;
-
-        if (((n = *s++) & 0xc0) == 0xc0) {
-            s = pkt + (((n&3) << 8) | *s);    /* New offset */
-            n = 0;
-            if (!labelj)
-                skip += 2;
-            labelj = true;
-        } else {
-            if (!labelj)
-                skip += std::min(n, dstlen - i) + 1;
-            for (j = 0; j < n && i < dstlen; j++)
-                dst[i++] = *s++;
-        }
-    }
-
-    dst[i] = '\0';
-    return skip + (labelj ? 0 : 1);
-}
 
 /*
  * Put given file descriptor in non-blocking mode. return 0 if success, or -1
@@ -389,66 +340,16 @@ void DNSResolver::purgeCache() {
     }
 }
 
-const uint8_t* DNSResolver::parse_answer(const uint8_t *pkt, int len, const uint8_t *p,
-                                         unsigned count, std::vector<struct dns_record> &r, enum dns_response_type respt) {
-    const uint8_t *e = pkt + len;
-    char name[1025];
-
-    /* Loop through the answers, we want A type answer */
-    for (unsigned a = 0; a < count && &p[12] < e; a++) {
-        /* Get answer NAME, make sure it matches! */
-        p += fetch(pkt, p, len, name, sizeof(name) - 1);
-
-        uint16_t type = ntohs(((uint16_t *)p)[0]);
-        uint32_t ttl = ntohl(((uint32_t *)p)[1]);
-        uint16_t dlen = ntohs(((uint16_t *)p)[4]);
-
-        p += 10;
-
-        struct dns_record rec;
-        rec.rtype = (enum dns_record_type)type;
-        rec.ttl = ttl;
-        rec.name = std::string(name);
-        rec.resptype = respt;
-
-        std::transform(rec.name.begin(), rec.name.end(), rec.name.begin(), ::tolower);
-
-        if (type == DNS_MX_RECORD ||
-            type == DNS_NS_RECORD ||
-            type == DNS_CNAME_RECORD) {
-
-			const uint8_t *poff = type == DNS_MX_RECORD ? &p[2] : p;
-
-            fetch(pkt, poff, len, name, sizeof(name) - 1);
-            rec.addr = std::string(name);
-
-            std::transform(rec.addr.begin(), rec.addr.end(), rec.addr.begin(), ::tolower);
-        } else {
-            if (dlen > e-p && e > p)
-                dlen = e-p;
-            rec.addr = std::string((char*)p, dlen);
-        }
-        r.push_back(rec);
-
-        p += dlen;
-    }
-
-    return p;
-}
-
 void DNSResolver::parse_udp(const unsigned char *pkt, int len) {
-    struct header *header;
-    const unsigned char *p, *e;
     Query *q;
-    int nlen;
 
     /* We sent 1 query. We want to see more that 1 answer. */
-    header = (struct header *) pkt;
+    struct header *header = (struct header *) pkt;
     if (ntohs(header->nqueries) != 1)
         return;
 
     /* Return if we did not send that query */
-    if ((q = find_active_query(header->tid)) == NULL)
+    if ((q = find_active_query(ntohs(header->tid))) == NULL)
         return;
 
     /* Received 0 answers */
@@ -457,27 +358,15 @@ void DNSResolver::parse_udp(const unsigned char *pkt, int len) {
         return;
     }
 
-    /* Skip host name */
-    for (e = pkt + len, nlen = 0, p = &header->data[0];
-        p < e && *p != '\0'; p++)
-        nlen++;
-
-    /* We sent query class 1, query type A/MX */
-    if (&p[5] > e || ntohs(*(uint16_t*)(p + 1)) != q->qtype)
-        return;
-
-    /* Go to the first answer section */
-    p += 5;
+	/* Actually parse the packet */
+	auto dnsp = parse_udp_packet(pkt, len);
 
     struct cache_entry entry;
     entry.hits = 0;
     entry.expire = std::numeric_limits<time_t>::max();
+	entry.replies = dnsp.answers;
 
-    p = parse_answer(pkt, len, p, ntohs(header->nanswers), entry.replies, RESPONSE_ANSWER);
-    p = parse_answer(pkt, len, p, ntohs(header->nauth), entry.replies, RESPONSE_AUTHORITATIVE);
-    p = parse_answer(pkt, len, p, ntohs(header->nother), entry.replies, RESPONSE_ADDITIONAL);
-
-    for (const auto &e: entry.replies)
+    for (const auto &e: dnsp.answers)
         entry.expire = std::min(time(NULL) + (time_t)e.ttl, entry.expire);
 
     // Insert finding in the cache
@@ -492,7 +381,7 @@ void DNSResolver::parse_udp(const unsigned char *pkt, int len) {
         call_user(this, q->name, q->qtype, &res.first->second, q->callback, q->ctx, DNS_OK);
 
     // Delete from active queries and cleanup
-    active.erase(header->tid);
+    active.erase(dnsp.header.tid);
     ongoing.erase(std::make_pair(q->name, q->qtype));
     delete q;
 
@@ -719,10 +608,7 @@ Query * DNSResolver::createQuery(unsigned niter, void *ctx, const char *name,
 void DNSResolver::queue(unsigned niter, void *ctx, const char *name, Query *dep,
                         enum dns_record_type qtype, dns_callback_t callback, struct sockaddr * dnss) {
     struct cache_entry * centry;
-    struct header    *header;
-    int i, n;
-    char pkt[DNS_PACKET_LEN], *p;
-    const char     *s;
+    uint8_t pkt[DNS_PACKET_LEN];
     struct dns_cb_data cbd;
 
     /* Search the cache first */
@@ -752,47 +638,24 @@ void DNSResolver::queue(unsigned niter, void *ctx, const char *name, Query *dep,
         query->deps.push_back(dep);
     name = query->name;
 
+	struct dns_packet outp;
+
     /* Prepare DNS packet header */
-    header        = (struct header *) pkt;
-    header->tid    = ++tidseq;
-    header->flags    = htons(0x100);        /* Haha. guess what it is */
-    header->nqueries= htons(1);        /* Just one query */
-    header->nanswers= 0;
-    header->nauth    = 0;
-    header->nother    = 0;
+    outp.header.tid      = ++tidseq;
+    outp.header.flags    = 0x100;        /* Haha. guess what it is */
+    outp.header.nqueries = 1;            /* Just one query */
+    outp.header.nanswers = 0;
+    outp.header.nauth    = 0;
+    outp.header.nother   = 0;
 
-    /* Encode DNS name */
-    int name_len = strlen(name);
-    bool nempty = name_len != 0;
-    p = (char *) &header->data;    /* For encoding host name into packet */
+	struct dns_question q;
+	q.qtype = qtype;
+	q.qclass = 0x0001;
+	q.name = std::string(name);
+	outp.questions.push_back(q);
 
-    do {
-        if ((s = strchr(name, '.')) == NULL)
-            s = name + name_len;
-
-        n = s - name;            /* Chunk length */
-        *p++ = n;            /* Copy length */
-        for (i = 0; i < n; i++)        /* Copy chunk */
-            *p++ = name[i];
-
-        if (*s == '.')
-            n++;
-
-        name += n;
-        name_len -= n;
-
-    } while (*s != '\0');
-
-    if (nempty)
-        *p++ = 0;            /* Mark end of host name */
-    *p++ = 0;            /* Well, lets put this byte as well */
-    *p++ = (unsigned char) qtype;    /* Query Type */
-
-    *p++ = 0;
-    *p++ = 1;            /* Class: inet, 0x0001 */
-
-    assert(p < pkt + sizeof(pkt));
-    n = p - pkt;            /* Total packet length */
+	unsigned psize = serialize_udp_packet(&outp, pkt);
+    assert(psize < sizeof(pkt));
 
     /* FIXME Add some queueing mechanism for packets? */
     if (dnss)
@@ -805,7 +668,7 @@ void DNSResolver::queue(unsigned niter, void *ctx, const char *name, Query *dep,
     int ssock = serv->sa_family == AF_INET ? sock4 : sock6;
     int addrl = serv->sa_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
 
-    if (sendto(ssock, pkt, n, 0, serv, addrl) != n) {
+    if (sendto(ssock, pkt, psize, 0, serv, addrl) != psize) {
         Query * reportq = dep ? dep : query;
         call_user(this, reportq->name, reportq->qtype, NULL, reportq->callback, reportq->ctx, DNS_ERROR);
         delete query;
