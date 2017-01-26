@@ -9,7 +9,6 @@
  */
 
 #include <stdio.h>
-#include <fcntl.h>
 #include <string.h>
 #include <assert.h>
 #include <stdlib.h>
@@ -49,8 +48,6 @@ typedef unsigned int uint32_t;
 #define DNS_MAX             1025    /* Maximum host name          */
 #define MAX_CACHE_ENTRIES   (1<<14) /* Dont cache more than that  */
 #define CACHE_PURGE_STEP    (1<<12) /* Dont cache more than that  */
-
-static int nonblock(int fd);
 
 /*
  * User query. Holds mapping from application-level ID to DNS transaction id,
@@ -144,20 +141,6 @@ protected:
     /* Cached queries */
     std::map< std::pair<std::string, uint16_t>, cache_entry> cached; 
 };
-
-/*
- * Put given file descriptor in non-blocking mode. return 0 if success, or -1
- */
-static int nonblock(int fd) {
-#ifdef    _WIN32
-    unsigned long on = 1;
-    return (ioctlsocket(fd, FIONBIO, &on));
-#else
-    int flags;
-    flags = fcntl(fd, F_GETFL, 0);
-    return (fcntl(fd, F_SETFL, flags | O_NONBLOCK));
-#endif /* _WIN32 */
-}
 
 bool parseAddr(const char *ipaddr, struct sockaddr_storage *addrout) {
     unsigned ok = 0;

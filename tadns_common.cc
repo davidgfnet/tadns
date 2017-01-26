@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <netinet/in.h>
 #include <string.h>
+#include <fcntl.h>
 
 #include "tadns_common.h"
 
@@ -105,13 +106,11 @@ struct dns_packet parse_udp_packet(const uint8_t *pkt, int len) {
 
         if (p + 4 >= e) return ret;
 
-        // Skip to answer section
-        p += 4;
-
         struct dns_question q;
-        q.qtype  = ((uint16_t*)p)[0];
-        q.qclass = ((uint16_t*)p)[1];
+        q.qtype  = ntohs(((uint16_t*)p)[0]);
+        q.qclass = ntohs(((uint16_t*)p)[1]);
         q.name = std::string(name);
+        p += 4;
 
         ret.questions.push_back(q);
     }
@@ -207,5 +206,15 @@ unsigned serialize_udp_packet(struct dns_packet *in, uint8_t *out) {
     return out - oout;
 }
 
+int nonblock(int fd) {
+#ifdef _WIN32
+    unsigned long on = 1;
+    return (ioctlsocket(fd, FIONBIO, &on));
+#else
+    int flags;
+    flags = fcntl(fd, F_GETFL, 0);
+    return (fcntl(fd, F_SETFL, flags | O_NONBLOCK));
+#endif /* _WIN32 */
+}
 
 
