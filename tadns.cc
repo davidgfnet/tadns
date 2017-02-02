@@ -520,6 +520,8 @@ void DNSResolver::resolve(void *ctx, std::string name,
 void DNSResolver::resolveInt(unsigned niter, void *ctx, std::string name,
                           enum dns_record_type qtype, dns_callback_t callback) {
 
+    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+
     if (niter >= DNS_QUERY_MAXITER) {
         call_user(this, name, qtype, NULL, callback, ctx, DNS_TIMEOUT);
         std::cout << "MAX Reached " << name << std::endl;
@@ -607,8 +609,9 @@ uint16_t DNSResolver::getNewTid() {
 void DNSResolver::queue(unsigned niter, void *ctx, std::string name, Query *dep,
                         enum dns_record_type qtype, dns_callback_t callback, struct sockaddr * dnss) {
     struct cache_entry * centry;
-    uint8_t pkt[DNS_PACKET_LEN];
     struct dns_cb_data cbd;
+
+    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
 
     /* Search the cache first */
     if ((centry = find_cached_query(qtype, name)) != NULL) {
@@ -652,6 +655,7 @@ void DNSResolver::queue(unsigned niter, void *ctx, std::string name, Query *dep,
     q.name = name;
     outp.questions.push_back(q);
 
+    uint8_t pkt[DNS_PACKET_LEN];
     unsigned psize = serialize_udp_packet(&outp, pkt);
     assert(psize < sizeof(pkt));
 
