@@ -126,7 +126,7 @@ int main(int argc, char *argv[]) {
             struct dns_packet pkt = parse_udp_packet(inbuff, received);
 
             // Just look at the first question for now
-            if (pkt.header.nqueries == 1 && pkt.questions[0].qclass == 1) {
+            if (pkt.questions.size() == 1 && pkt.questions[0].qclass == 1) {
                 // Create response
                 struct dns_response *dresp = new struct dns_response;
 

@@ -104,12 +104,13 @@ struct dns_packet parse_udp_packet(const uint8_t *pkt, int len) {
         char name[1025];
         p += fetch(pkt, p, len, name, sizeof(name) - 1);
 
-        if (p + 4 >= e) return ret;
+        if (p + 4 > e) return ret;
 
         struct dns_question q;
         q.qtype  = ntohs(((uint16_t*)p)[0]);
         q.qclass = ntohs(((uint16_t*)p)[1]);
         q.name = std::string(name);
+        std::transform(q.name.begin(), q.name.end(), q.name.begin(), ::tolower);
         p += 4;
 
         ret.questions.push_back(q);

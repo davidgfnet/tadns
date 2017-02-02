@@ -64,7 +64,7 @@ public:
     time_t timeout;          /* Time when this query timeout */
     unsigned niter;          /* Number of iterations to resolve this */
     uint16_t qtype;          /* Query type */
-    char name[DNS_MAX];      /* Host name */
+    std::string name;        /* Host name */
     void *ctx;               /* Application context */
     dns_callback_t callback; /* User callback routine */
     std::vector<Query*> deps;/* Dependant query */
@@ -119,14 +119,15 @@ protected:
     void parse_udp(const unsigned char *pkt, int len);
     void purgeCache();
     struct sockaddr *getNextServer();
-    void queue(unsigned niter, void *ctx, const char *name, Query *dep, enum dns_record_type qtype,
+    void queue(unsigned niter, void *ctx, std::string name, Query *dep, enum dns_record_type qtype,
                dns_callback_t callback, struct sockaddr * dnss);
-    Query *createQuery(unsigned niter, void *ctx, const char *name, enum dns_record_type qtype, dns_callback_t callback);
+    Query *createQuery(unsigned niter, void *ctx, std::string name, enum dns_record_type qtype, dns_callback_t callback);
     std::string getNSipaddr(unsigned niter, std::vector<struct dns_record> recs, std::string dom,
             void *ctx, std::string name, enum dns_record_type qtype, dns_callback_t callback);
     void resolveInt(unsigned niter, void *context, std::string host, enum dns_record_type type, dns_callback_t callback);
 
     Query * find_active_query(uint16_t tid) const { return active.count(tid) ? active.at(tid) : NULL; }
+    uint16_t getNewTid();
 
     /* UDP sockets used for queries */
     int sock4, sock6;
@@ -278,6 +279,7 @@ void DNSResolver::cancel(const void *context) {
             ongoing.erase(std::make_pair(it.second->name, it.second->qtype));
             delete it.second;
             active.erase(it.first);
+            assert(active.size() == ongoing.size());
             return;
         }
     }
@@ -341,13 +343,19 @@ void DNSResolver::parse_udp(const unsigned char *pkt, int len) {
         return;
     }
 
-	/* Actually parse the packet */
-	auto dnsp = parse_udp_packet(pkt, len);
+    /* Actually parse the packet */
+    auto dnsp = parse_udp_packet(pkt, len);
+
+    /* Check whether the query matches at all! */
+    if (dnsp.questions.size() == 0 || dnsp.questions[0].name != q->name) {
+        call_user(this, q->name, q->qtype, NULL, q->callback, q->ctx, DNS_ERROR);
+        return;
+    }
 
     struct cache_entry entry;
     entry.hits = 0;
     entry.expire = std::numeric_limits<time_t>::max();
-	entry.replies = dnsp.answers;
+    entry.replies = dnsp.answers;
 
     for (const auto &e: dnsp.answers)
         entry.expire = std::min(time(NULL) + (time_t)e.ttl, entry.expire);
@@ -366,6 +374,7 @@ void DNSResolver::parse_udp(const unsigned char *pkt, int len) {
     // Delete from active queries and cleanup
     active.erase(dnsp.header.tid);
     ongoing.erase(std::make_pair(q->name, q->qtype));
+    assert(active.size() == ongoing.size());
     delete q;
 
     purgeCache();
@@ -410,6 +419,7 @@ int DNSResolver::poll() {
             ongoing.erase(std::make_pair(ita->second->name, ita->second->qtype));
             delete ita->second;
             ita = active.erase(ita);
+            assert(active.size() == ongoing.size());
         }
         else ita++;
     }
@@ -491,10 +501,10 @@ DNSResolver::getNSipaddr(unsigned niter, std::vector<struct dns_record> recs, st
 
     // Now, packet was useless, cache too, issue a request for ips
     // Prefetch all of them for better balancing and stuff
-	#ifdef DO_DNS_PREFETCH
+    #ifdef DO_DNS_PREFETCH
     for (const auto & e: nsrecs)
         this->queue(niter, NULL, e.c_str(), NULL, DNS_A_RECORD, NULL, NULL);
-	#endif
+    #endif
     
     Query * oq = createQuery(niter, ctx, name.c_str(), qtype, callback);
     this->queue(niter, NULL, nsrecs[0].c_str(), oq, DNS_A_RECORD, NULL, NULL);
@@ -568,8 +578,10 @@ void DNSResolver::resolveInt(unsigned niter, void *ctx, std::string name,
     }
 }
 
-Query * DNSResolver::createQuery(unsigned niter, void *ctx, const char *name, 
+Query * DNSResolver::createQuery(unsigned niter, void *ctx, std::string name,
                     enum dns_record_type qtype, dns_callback_t callback) {
+
+    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
 
     time_t now = time(NULL);
     Query * query = new Query();
@@ -578,17 +590,21 @@ Query * DNSResolver::createQuery(unsigned niter, void *ctx, const char *name,
     query->callback = callback;
     query->timeout = now + DNS_QUERY_TIMEOUT;
     query->niter = niter + 1;
-
-    char *p;
-    for (p = query->name; *name &&
-        p < query->name + sizeof(query->name) - 1; name++, p++)
-        *p = tolower(*name);
-    *p = '\0';
+    query->name = name;
 
     return query;
 }
 
-void DNSResolver::queue(unsigned niter, void *ctx, const char *name, Query *dep,
+uint16_t DNSResolver::getNewTid() {
+    while(1) {
+        uint16_t n = ++tidseq;
+        if (active.count(n) == 0)
+            return n;
+        std::cout << "Dup!" << std::endl;
+    }
+}
+
+void DNSResolver::queue(unsigned niter, void *ctx, std::string name, Query *dep,
                         enum dns_record_type qtype, dns_callback_t callback, struct sockaddr * dnss) {
     struct cache_entry * centry;
     uint8_t pkt[DNS_PACKET_LEN];
@@ -619,25 +635,24 @@ void DNSResolver::queue(unsigned niter, void *ctx, const char *name, Query *dep,
     Query * query = createQuery(niter, ctx, name, qtype, callback);
     if (dep)
         query->deps.push_back(dep);
-    name = query->name;
 
-	struct dns_packet outp;
+    struct dns_packet outp;
 
     /* Prepare DNS packet header */
-    outp.header.tid      = ++tidseq;
+    outp.header.tid      = getNewTid();
     outp.header.flags    = 0x100;        /* Haha. guess what it is */
     outp.header.nqueries = 1;            /* Just one query */
     outp.header.nanswers = 0;
     outp.header.nauth    = 0;
     outp.header.nother   = 0;
 
-	struct dns_question q;
-	q.qtype = qtype;
-	q.qclass = 0x0001;
-	q.name = std::string(name);
-	outp.questions.push_back(q);
+    struct dns_question q;
+    q.qtype = qtype;
+    q.qclass = 0x0001;
+    q.name = name;
+    outp.questions.push_back(q);
 
-	unsigned psize = serialize_udp_packet(&outp, pkt);
+    unsigned psize = serialize_udp_packet(&outp, pkt);
     assert(psize < sizeof(pkt));
 
     /* FIXME Add some queueing mechanism for packets? */
@@ -656,9 +671,9 @@ void DNSResolver::queue(unsigned niter, void *ctx, const char *name, Query *dep,
         call_user(this, reportq->name, reportq->qtype, NULL, reportq->callback, reportq->ctx, DNS_ERROR);
         delete query;
     } else {
-        assert(active.size() == ongoing.size());
-        active.emplace(tidseq, query);
+        active.emplace(outp.header.tid, query);
         ongoing[lookup] = query;
+        assert(active.size() == ongoing.size());
     }
 }
 
