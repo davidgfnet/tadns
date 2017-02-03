@@ -45,9 +45,9 @@ typedef unsigned int uint32_t;
 #include "tadns.h"
 #include "tadns_common.h"
 
-#define DNS_MAX             1025    /* Maximum host name          */
-#define MAX_CACHE_ENTRIES   (1<<14) /* Dont cache more than that  */
-#define CACHE_PURGE_STEP    (1<<12) /* Dont cache more than that  */
+#define MIN_TTL_TIME            60  /* Minimum TTL time (secs)   */
+#define MAX_CACHE_ENTRIES   (1<<16) /* Dont cache more than that */
+#define CACHE_PURGE_STEP    (1<<14) /* Dont cache more than that */
 
 /*
  * User query. Holds mapping from application-level ID to DNS transaction id,
@@ -55,8 +55,13 @@ typedef unsigned int uint32_t;
  */
 class Query {
 public:
-    Query() : niter(0), callback(NULL) {}
+    Query() : niter(0), callback(NULL), deps_on(0) {}
     ~Query() {
+        // Remove the entry from the parent deps list
+        assert(!deps_on || deps_on->deps.count(this));
+        if (deps_on)
+            deps_on->deps.erase(this);
+
         for (auto e: deps)
             delete e;
     }
@@ -67,7 +72,8 @@ public:
     std::string name;        /* Host name */
     void *ctx;               /* Application context */
     dns_callback_t callback; /* User callback routine */
-    std::vector<Query*> deps;/* Dependant query */
+    std::set<Query*> deps;   /* Dependant queries */
+    Query* deps_on;          /* Query we wait on */
 };
 
 struct cache_entry {
@@ -119,12 +125,12 @@ protected:
     void parse_udp(const unsigned char *pkt, int len);
     void purgeCache();
     struct sockaddr *getNextServer();
-    void queue(unsigned niter, void *ctx, std::string name, Query *dep, enum dns_record_type qtype,
-               dns_callback_t callback, struct sockaddr * dnss);
+    void queue(unsigned niter, std::string name, Query *dep, enum dns_record_type qtype, struct sockaddr * dnss);
     Query *createQuery(unsigned niter, void *ctx, std::string name, enum dns_record_type qtype, dns_callback_t callback);
     std::string getNSipaddr(unsigned niter, std::vector<struct dns_record> recs, std::string dom,
             void *ctx, std::string name, enum dns_record_type qtype, dns_callback_t callback);
     void resolveInt(unsigned niter, void *context, std::string host, enum dns_record_type type, dns_callback_t callback);
+    void call_user_rec(Query *q, enum dns_error err);
 
     Query * find_active_query(uint16_t tid) const { return active.count(tid) ? active.at(tid) : NULL; }
     uint16_t getNewTid();
@@ -327,57 +333,72 @@ void DNSResolver::purgeCache() {
 
 void DNSResolver::parse_udp(const unsigned char *pkt, int len) {
     Query *q;
-
-    /* We sent 1 query. We want to see more that 1 answer. */
     struct header *header = (struct header *) pkt;
-    if (ntohs(header->nqueries) != 1)
-        return;
 
     /* Return if we did not send that query */
     if ((q = find_active_query(ntohs(header->tid))) == NULL)
         return;
 
-    /* Received 0 answers */
-    if ((header->nanswers | header->nauth | header->nother) == 0) {
-        call_user(this, q->name, q->qtype, NULL, q->callback, q->ctx, DNS_DOES_NOT_EXIST);
-        return;
-    }
-
     /* Actually parse the packet */
     auto dnsp = parse_udp_packet(pkt, len);
 
-    /* Check whether the query matches at all! */
-    if (dnsp.questions.size() == 0 || dnsp.questions[0].name != q->name) {
-        call_user(this, q->name, q->qtype, NULL, q->callback, q->ctx, DNS_ERROR);
-        return;
+    std::vector< std::tuple<unsigned, void*, std::string, enum dns_record_type, dns_callback_t> > deferred;
+    if (ntohs(header->nqueries) != 1)
+        /* We sent 1 query. We want to see more that 1 answer. */
+        call_user_rec(q, DNS_ERROR);
+    else if ((header->nanswers | header->nauth | header->nother) == 0)
+        /* Received 0 answers */
+        call_user_rec(q, DNS_DOES_NOT_EXIST);
+    else if (dnsp.questions.size() == 0 || dnsp.questions[0].name != q->name)
+        /* Check whether the query matches at all! */
+        call_user_rec(q, DNS_ERROR);
+    else {
+        struct cache_entry entry;
+        entry.hits = 0;
+        entry.expire = std::numeric_limits<time_t>::max();
+        entry.replies = dnsp.answers;
+
+        for (const auto &e: dnsp.answers)
+            entry.expire = std::min(time(NULL) + (time_t)e.ttl, entry.expire);
+
+        // Detected some 0 TTL answers, that's an issue cause we rely on the cache as an intermediate
+        // structure. That works as long as ttls are significantly bigger than DNS response latency
+        entry.expire = std::max(time(NULL) + MIN_TTL_TIME, entry.expire);
+
+        // Insert finding in the cache
+        auto cacheentry = std::make_pair(q->name, q->qtype);
+        cached.erase(cacheentry);
+        auto res = cached.emplace(cacheentry, entry);
+
+        /* If query has a dependant, do not notify the user but re-schedule it */
+        if (q->deps.size())
+            for (auto de: q->deps)
+                deferred.push_back(std::make_tuple(q->niter, de->ctx, de->name, (enum dns_record_type)de->qtype, de->callback));
+        else
+            call_user(this, q->name, q->qtype, &res.first->second, q->callback, q->ctx, DNS_OK);
     }
-
-    struct cache_entry entry;
-    entry.hits = 0;
-    entry.expire = std::numeric_limits<time_t>::max();
-    entry.replies = dnsp.answers;
-
-    for (const auto &e: dnsp.answers)
-        entry.expire = std::min(time(NULL) + (time_t)e.ttl, entry.expire);
-
-    // Insert finding in the cache
-    cached.erase(std::make_pair(q->name, q->qtype));
-    auto res = cached.emplace(std::make_pair(q->name, q->qtype), entry);
-
-    /* If query has a dependant, do not notify the user but re-schedule it */
-    if (q->deps.size())
-        for (auto de: q->deps)
-            resolveInt(q->niter, de->ctx, de->name, (enum dns_record_type)de->qtype, de->callback);
-    else
-        call_user(this, q->name, q->qtype, &res.first->second, q->callback, q->ctx, DNS_OK);
 
     // Delete from active queries and cleanup
     active.erase(dnsp.header.tid);
     ongoing.erase(std::make_pair(q->name, q->qtype));
     assert(active.size() == ongoing.size());
+
+    // Remove the query from the deps list
     delete q;
 
+    // Retry deferred queries
+    for (auto df: deferred)
+        resolveInt(std::get<0>(df), std::get<1>(df), std::get<2>(df), std::get<3>(df), std::get<4>(df));
+
     purgeCache();
+}
+
+void DNSResolver::call_user_rec(Query *q, enum dns_error err) {
+    // If this query has dependencies don't report it
+    for (auto de: q->deps)
+        call_user_rec(de, err);
+
+    call_user(this, q->name, q->qtype, NULL, q->callback, q->ctx, err);
 }
 
 int DNSResolver::poll() {
@@ -407,14 +428,7 @@ int DNSResolver::poll() {
     auto ita = active.begin();
     while (ita != active.end()) {
         if (ita->second->timeout < now) {
-            /* Report the original query if exists */
-            if (ita->second->deps.size())
-                for (auto de: ita->second->deps)
-                    call_user(this, de->name, de->qtype, NULL,
-                              de->callback, de->ctx, DNS_TIMEOUT);
-            else
-                call_user(this, ita->second->name, ita->second->qtype, NULL,
-                          ita->second->callback, ita->second->ctx, DNS_TIMEOUT);
+            call_user_rec(ita->second, DNS_TIMEOUT);
 
             ongoing.erase(std::make_pair(ita->second->name, ita->second->qtype));
             delete ita->second;
@@ -486,14 +500,18 @@ DNSResolver::getNSipaddr(unsigned niter, std::vector<struct dns_record> recs, st
 
     // Seems like we don't have it in the packet, check the query cache
     std::vector<std::string> ipaddrs;
-    for (const auto & e: nsrecs) {
-        struct cache_entry *nsentry = find_cached_query(DNS_A_RECORD, e);
+    int totry = -1;
+    //for (const auto & e: nsrecs) {
+    for (unsigned i = 0; i < nsrecs.size(); i++) {
+        struct cache_entry *nsentry = find_cached_query(DNS_A_RECORD, nsrecs[i]);
         if (nsentry != NULL) {
             // Get any valid IP address (random)
             for (const auto & aent: nsentry->replies)
-                if (aent.name == e && aent.rtype == DNS_A_RECORD)
+                if (aent.name == nsrecs[i] && aent.rtype == DNS_A_RECORD)
                     ipaddrs.push_back(aent.addr);
         }
+        else
+            totry = i;
     }
     // Pick a random one if any, a bit biased here
     if (ipaddrs.size())
@@ -503,12 +521,18 @@ DNSResolver::getNSipaddr(unsigned niter, std::vector<struct dns_record> recs, st
     // Prefetch all of them for better balancing and stuff
     #ifdef DO_DNS_PREFETCH
     for (const auto & e: nsrecs)
-        this->queue(niter, NULL, e.c_str(), NULL, DNS_A_RECORD, NULL, NULL);
+        this->queue(niter, e, NULL, DNS_A_RECORD, NULL);
     #endif
-    
-    Query * oq = createQuery(niter, ctx, name.c_str(), qtype, callback);
-    this->queue(niter, NULL, nsrecs[0].c_str(), oq, DNS_A_RECORD, NULL, NULL);
 
+    if (totry >= 0) {
+        Query * oq = createQuery(niter, ctx, name, qtype, callback);
+        this->queue(niter, nsrecs[totry], oq, DNS_A_RECORD, NULL);
+        return "";
+    }
+    else {
+        // None of the NS servers are really up for this!
+        call_user(this, name, qtype, NULL, callback, ctx, DNS_DOES_NOT_EXIST);
+    }
     return "";
 }
 
@@ -570,9 +594,9 @@ void DNSResolver::resolveInt(unsigned niter, void *ctx, std::string name,
                 dnss = (struct sockaddr*)&addrunion;
             }
         } else {
-            // We don't have the NS for that record, ask for it
-            Query * oq = createQuery(niter, ctx, name.c_str(), qtype, callback);
-            this->queue(niter, NULL, part.c_str(), oq, iqtype, NULL, dnss);
+            // We don't have the NS for that record, ask for it (cache miss)
+            Query * oq = createQuery(niter, ctx, name, qtype, callback);
+            this->queue(niter, part, oq, iqtype, dnss);
             return; // Will come back here eventually :D
         }
 
@@ -606,8 +630,8 @@ uint16_t DNSResolver::getNewTid() {
     }
 }
 
-void DNSResolver::queue(unsigned niter, void *ctx, std::string name, Query *dep,
-                        enum dns_record_type qtype, dns_callback_t callback, struct sockaddr * dnss) {
+// Precondition, a query with dep!=0 cannot have a cache hit (check before queuing)
+void DNSResolver::queue(unsigned niter, std::string name, Query *dep, enum dns_record_type qtype, struct sockaddr * dnss) {
     struct cache_entry * centry;
     struct dns_cb_data cbd;
 
@@ -615,9 +639,9 @@ void DNSResolver::queue(unsigned niter, void *ctx, std::string name, Query *dep,
 
     /* Search the cache first */
     if ((centry = find_cached_query(qtype, name)) != NULL) {
+        assert(dep == NULL);
+
         centry->hits++;
-        call_user(this, name, qtype, centry, callback, ctx, DNS_OK);
-        if (dep) delete dep;
         return;
     }
 
@@ -625,19 +649,21 @@ void DNSResolver::queue(unsigned niter, void *ctx, std::string name, Query *dep,
     // Dependants get merged and will be waken all together
     // if there is no callback to the user, safe to ignore it
     auto lookup = std::make_pair(name, qtype);
-    if (dep || !callback) {
-        auto existingq = ongoing.find(lookup);
-        if (existingq != ongoing.end()) {
-            if (dep)
-                existingq->second->deps.push_back(dep);
-            return;
+    auto existingq = ongoing.find(lookup);
+    if (existingq != ongoing.end()) {
+        if (dep) {
+            existingq->second->deps.insert(dep);
+            dep->deps_on = existingq->second;
         }
+        return;
     }
 
     /* Allocate new query */
-    Query * query = createQuery(niter, ctx, name, qtype, callback);
-    if (dep)
-        query->deps.push_back(dep);
+    Query * query = createQuery(niter, NULL, name, qtype, NULL);
+    if (dep) {
+        query->deps.insert(dep);
+        dep->deps_on = query;
+    }
 
     struct dns_packet outp;
 
@@ -691,9 +717,11 @@ static void usage(const char *prog) {
 }
 
 unsigned inflight = 0;
+std::set<std::string> stillrunning;
 
 static void callback(struct dns_cb_data *cbd) {
     inflight--;
+    stillrunning.erase(cbd->name);
 
     switch (cbd->error) {
     case DNS_OK:
@@ -761,6 +789,7 @@ int main(int argc, char *argv[]) {
     /* Select on resolver socket */
     do {
         while (*domains != 0 && inflight < 100) {
+            stillrunning.insert(*domains);
             dns->resolve(NULL, *domains++, qtype, callback);
             inflight++;
         }
@@ -775,6 +804,8 @@ int main(int argc, char *argv[]) {
 
         dns->poll();
     } while (dns->ongoingReqs() || *domains != 0);
+
+    assert(stillrunning.size() == 0);
 
     delete dns;
 
