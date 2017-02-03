@@ -73,7 +73,6 @@ struct dns_cb_data {
 
 typedef void (*dns_callback_t)(struct dns_cb_data *);
 
-#define    DNS_QUERY_TIMEOUT    5   /* Query timeout, seconds */
 #define    DNS_QUERY_MAXITER   16   /* Query max iterations */
 
 //#define DO_DNS_PREFETCH              /* Do prefetch when more than one server is available */
@@ -95,6 +94,6 @@ public:
     virtual unsigned ongoingReqs() = 0;
 };
 
-extern class DNSResolverIface *createResolver(const char **dns_servers);
+extern class DNSResolverIface *createResolver(const char **dns_servers, unsigned atimeout);
 
 #endif /* DNS_HEADER_INCLUDED */

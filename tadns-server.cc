@@ -80,7 +80,7 @@ int main(int argc, char *argv[]) {
     //    usage(prog);
 
     DNSResolverIface *dns;
-    if ((dns = createResolver(NULL)) == NULL) {
+    if ((dns = createResolver(NULL, 10)) == NULL) {
         (void) fprintf(stderr, "failed to init resolver\n");
         exit(EXIT_FAILURE);
     }

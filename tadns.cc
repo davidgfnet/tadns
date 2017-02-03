@@ -66,7 +66,7 @@ public:
             delete e;
     }
 
-    time_t timeout;          /* Time when this query timeout */
+    time_t atimeout;         /* Activity timeout for the query */
     unsigned niter;          /* Number of iterations to resolve this */
     uint16_t qtype;          /* Query type */
     std::string name;        /* Host name */
@@ -87,8 +87,8 @@ struct cache_entry {
  */
 class DNSResolver : public DNSResolverIface {
 public:
-    DNSResolver(std::list<struct sockaddr_storage> serverbundle)
-      : pkts_dns_servers(0), pkts_auth_servers(0), dns_servers(serverbundle) {
+    DNSResolver(std::list<struct sockaddr_storage> serverbundle, unsigned atimeout)
+      : pkts_dns_servers(0), pkts_auth_servers(0), dns_servers(serverbundle), atimeout(atimeout) {
         this->sock4 = socket(PF_INET,  SOCK_DGRAM, 17);
         this->sock6 = socket(PF_INET6, SOCK_DGRAM, 17);
         /* Make it non blocking */
@@ -147,6 +147,8 @@ protected:
     std::map< std::pair<std::string, uint16_t>, Query*> ongoing;
     /* Cached queries */
     std::map< std::pair<std::string, uint16_t>, cache_entry> cached; 
+    /* Timeouts */
+    unsigned atimeout;
 };
 
 bool parseAddr(const char *ipaddr, struct sockaddr_storage *addrout) {
@@ -228,7 +230,7 @@ static std::list<struct sockaddr_storage> getdnsip() {
 }
 #endif
 
-DNSResolverIface * createResolver(const char **dns_servers) {
+DNSResolverIface * createResolver(const char **dns_servers, unsigned atimeout) {
 #ifdef _WIN32
     { WSADATA data; WSAStartup(MAKEWORD(2,2), &data); }
 #endif /* _WIN32 */
@@ -252,7 +254,7 @@ DNSResolverIface * createResolver(const char **dns_servers) {
         }
     }
 
-    DNSResolver *dns = new DNSResolver(serverbundle);
+    DNSResolver *dns = new DNSResolver(serverbundle, atimeout);
 
     return (dns);
 }
@@ -427,7 +429,7 @@ int DNSResolver::poll() {
     /* Cleanup expired active queries */
     auto ita = active.begin();
     while (ita != active.end()) {
-        if (ita->second->timeout < now) {
+        if (ita->second->atimeout < now) {
             call_user_rec(ita->second, DNS_TIMEOUT);
 
             ongoing.erase(std::make_pair(ita->second->name, ita->second->qtype));
@@ -614,7 +616,7 @@ Query * DNSResolver::createQuery(unsigned niter, void *ctx, std::string name,
     query->ctx = ctx;
     query->qtype = (uint16_t) qtype;
     query->callback = callback;
-    query->timeout = now + DNS_QUERY_TIMEOUT;
+    query->atimeout = now + this->atimeout;
     query->niter = niter + 1;
     query->name = name;
 
@@ -781,7 +783,7 @@ int main(int argc, char *argv[]) {
     }
 
     DNSResolverIface *dns;
-    if ((dns = createResolver(NULL)) == NULL) {
+    if ((dns = createResolver(NULL, 10)) == NULL) {
         (void) fprintf(stderr, "failed to init resolver\n");
         exit(EXIT_FAILURE);
     }
