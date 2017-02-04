@@ -59,6 +59,7 @@ void resolved_cb(struct dns_cb_data *cbdata) {
         break;
     case DNS_TIMEOUT:
     case DNS_ERROR:
+    case DNS_NET_ERROR:
         dresp->pkt.header.flags = 0x8182;
         break;
     };
@@ -72,12 +73,7 @@ void resolved_cb(struct dns_cb_data *cbdata) {
 }
 
 int main(int argc, char *argv[]) {
-    const char *prog = argv[0];
-
     int port = 53;
-
-    //if (argc == 1)
-    //    usage(prog);
 
     DNSResolverIface *dns;
     if ((dns = createResolver(NULL, 10)) == NULL) {
@@ -141,7 +137,8 @@ int main(int argc, char *argv[]) {
 
                 dresp->pkt.questions.push_back(pkt.questions[0]);
 
-                dns->resolve(dresp, pkt.questions[0].name, (enum dns_record_type)pkt.questions[0].qtype, resolved_cb);
+                dns->resolve(pkt.questions[0].name, (enum dns_record_type)pkt.questions[0].qtype,
+                             resolved_cb, dresp, 0);
             }
         }
 

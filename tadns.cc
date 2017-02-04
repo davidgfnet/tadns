@@ -115,7 +115,7 @@ public:
     }
 
     std::pair<int,int> getFds() const { return std::make_pair(sock4, sock6); }
-    void resolve(void *context, std::string host, enum dns_record_type type, dns_callback_t callback) override;
+    void resolve(std::string host, enum dns_record_type type, dns_callback_t callback, void *context, unsigned options) override;
     void cancel(const void *context) override;
     int poll() override;
     unsigned ongoingReqs() override { return active.size(); }
@@ -126,8 +126,9 @@ protected:
     void purgeCache();
     struct sockaddr *getNextServer();
     void queue(unsigned niter, std::string name, Query *dep, enum dns_record_type qtype, struct sockaddr * dnss);
+    void send_dns_packet(Query *query, struct sockaddr * dnss);
     Query *createQuery(unsigned niter, void *ctx, std::string name, enum dns_record_type qtype, dns_callback_t callback);
-    std::string getNSipaddr(unsigned niter, std::vector<struct dns_record> recs, std::string dom,
+    std::string getNSipaddr(unsigned level, unsigned niter, std::vector<struct dns_record> recs, std::string dom,
             void *ctx, std::string name, enum dns_record_type qtype, dns_callback_t callback);
     void resolveInt(unsigned niter, void *context, std::string host, enum dns_record_type type, dns_callback_t callback);
     void call_user_rec(Query *q, enum dns_error err);
@@ -272,6 +273,7 @@ cache_entry* DNSResolver::find_cached_query(enum dns_record_type qtype, std::str
     auto entry = std::make_pair(name, qtype);
     if (cached.find(entry) != cached.end()) {
         auto r = &(cached.at(entry));
+        r->hits++;
         if (r->expire > now)
             return r;
     }
@@ -318,6 +320,8 @@ void DNSResolver::purgeCache() {
         /* Cleanup cached queries */
         auto itc = cached.begin();
         while (itc != cached.end()) {
+            // Halve hits to allow new domains some opportunity
+            itc->second.hits >>= 4;
             if (itc->second.expire < now)
                 itc = cached.erase(itc);
             else {
@@ -472,8 +476,8 @@ std::pair<std::string, bool> tokenizedom (std::string dom, unsigned level) {
 // Given a response to NS query, get an A ip that points to them
 // Can return an IP, an error (cannot recover) or try again later
 std::string
-DNSResolver::getNSipaddr(unsigned niter, std::vector<struct dns_record> recs, std::string dom,
-                         void *ctx, std::string name,
+DNSResolver::getNSipaddr(unsigned level, unsigned niter, std::vector<struct dns_record> recs,
+                         std::string dom, void *ctx, std::string name,
                          enum dns_record_type qtype, dns_callback_t callback) {
 
     // Filter all the NS records
@@ -522,8 +526,10 @@ DNSResolver::getNSipaddr(unsigned niter, std::vector<struct dns_record> recs, st
     // Now, packet was useless, cache too, issue a request for ips
     // Prefetch all of them for better balancing and stuff
     #ifdef DO_DNS_PREFETCH
-    for (const auto & e: nsrecs)
-        this->queue(niter, e, NULL, DNS_A_RECORD, NULL);
+    if (level <= DO_DNS_PREFETCH) {
+        for (const auto & e: nsrecs)
+            this->queue(niter, e, NULL, DNS_A_RECORD, NULL);
+    }
     #endif
 
     if (totry >= 0) {
@@ -538,9 +544,14 @@ DNSResolver::getNSipaddr(unsigned niter, std::vector<struct dns_record> recs, st
     return "";
 }
 
-void DNSResolver::resolve(void *ctx, std::string name,
-                          enum dns_record_type qtype, dns_callback_t callback) {
-    this->resolveInt(0, ctx, name, qtype, callback);
+void DNSResolver::resolve(std::string name, enum dns_record_type qtype,
+                          dns_callback_t callback, void *ctx, unsigned options) {
+    if (options & DNS_OPT_RECURSIVE_SOLVE) {
+        Query * oq = createQuery(0, ctx, name, qtype, callback);
+        this->queue(0, name, oq, qtype, NULL);
+    } else {
+        this->resolveInt(0, ctx, name, qtype, callback);
+    }
 }
 
 void DNSResolver::resolveInt(unsigned niter, void *ctx, std::string name,
@@ -550,7 +561,13 @@ void DNSResolver::resolveInt(unsigned niter, void *ctx, std::string name,
 
     if (niter >= DNS_QUERY_MAXITER) {
         call_user(this, name, qtype, NULL, callback, ctx, DNS_TIMEOUT);
-        std::cout << "MAX Reached " << name << std::endl;
+        return;
+    }
+
+    /* Check cache right away */
+    struct cache_entry *dentry = find_cached_query(qtype, name);
+    if (dentry) {
+        call_user(this, name, qtype, dentry, callback, ctx, DNS_OK);
         return;
     }
 
@@ -571,8 +588,6 @@ void DNSResolver::resolveInt(unsigned niter, void *ctx, std::string name,
         /* Search the cache first */
         struct cache_entry *centry = find_cached_query(iqtype, part);
         if (centry != NULL) {
-            centry->hits++;
-            
             if (lastq) {
                 assert(iqtype == qtype);
                 // This is the original request, all set, shoot!
@@ -583,7 +598,7 @@ void DNSResolver::resolveInt(unsigned niter, void *ctx, std::string name,
             // We get here cause the current "part" has some NS responses
             // Sometimes the NS responses come with the A/AAAA records (optimization!)
             // Also we don't want to always use the same NS server, so round robin it
-            std::string ipaddr = getNSipaddr(niter, centry->replies, part, ctx, name, qtype, callback);
+            std::string ipaddr = getNSipaddr(level, niter, centry->replies, part, ctx, name, qtype, callback);
 
             if (!ipaddr.size())
                 return;
@@ -642,8 +657,6 @@ void DNSResolver::queue(unsigned niter, std::string name, Query *dep, enum dns_r
     /* Search the cache first */
     if ((centry = find_cached_query(qtype, name)) != NULL) {
         assert(dep == NULL);
-
-        centry->hits++;
         return;
     }
 
@@ -667,6 +680,11 @@ void DNSResolver::queue(unsigned niter, std::string name, Query *dep, enum dns_r
         dep->deps_on = query;
     }
 
+    send_dns_packet(query, dnss);
+}
+
+
+void DNSResolver::send_dns_packet(Query *query, struct sockaddr * dnss) {
     struct dns_packet outp;
 
     /* Prepare DNS packet header */
@@ -678,9 +696,9 @@ void DNSResolver::queue(unsigned niter, std::string name, Query *dep, enum dns_r
     outp.header.nother   = 0;
 
     struct dns_question q;
-    q.qtype = qtype;
+    q.qtype = query->qtype;
     q.qclass = 0x0001;
-    q.name = name;
+    q.name = query->name;
     outp.questions.push_back(q);
 
     uint8_t pkt[DNS_PACKET_LEN];
@@ -699,10 +717,10 @@ void DNSResolver::queue(unsigned niter, std::string name, Query *dep, enum dns_r
     int addrl = serv->sa_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
 
     if (sendto(ssock, pkt, psize, 0, serv, addrl) != psize) {
-        Query * reportq = dep ? dep : query;
-        call_user(this, reportq->name, reportq->qtype, NULL, reportq->callback, reportq->ctx, DNS_ERROR);
+        call_user_rec(query, DNS_NET_ERROR);
         delete query;
     } else {
+        auto lookup = std::make_pair(query->name, query->qtype);
         active.emplace(outp.header.tid, query);
         ongoing[lookup] = query;
         assert(active.size() == ongoing.size());
@@ -759,6 +777,9 @@ static void callback(struct dns_cb_data *cbd) {
     case DNS_DOES_NOT_EXIST:
         printf("No such address: [%s]\n", cbd->name.c_str());
         break;
+    case DNS_NET_ERROR:
+        printf("Network error: [%s]\n", cbd->name.c_str());
+        break;
     case DNS_ERROR:
         printf("System error occured\n");
         break;
@@ -766,21 +787,29 @@ static void callback(struct dns_cb_data *cbd) {
 }
 
 int main(int argc, char *argv[]) {
-    const char *prog = argv[0];
     enum dns_record_type qtype = DNS_A_RECORD;
 
-    if (argc == 1)
-        usage(prog);
+    unsigned options = 0;
+    int off = 1;
+    while (off < argc) {
+        if (!argv[off] || argv[off][0] != '-')
+            break;
 
-    char ** domains = argv[1][0] == '-' ? &argv[2] : &argv[1];
-    if (argc > 2) {
-        if (!strcmp(argv[1], "-mx"))
+        if (!strcmp(argv[off], "-mx"))
             qtype = DNS_MX_RECORD;
-        else if (!strcmp(argv[1], "-a"))
+        else if (!strcmp(argv[off], "-a"))
             qtype = DNS_A_RECORD;
-        else if (!strcmp(argv[1], "-aaaa"))
+        else if (!strcmp(argv[off], "-aaaa"))
             qtype = DNS_AAAA_RECORD;
+        else if (!strcmp(argv[off], "-r"))
+            options |= DNS_OPT_RECURSIVE_SOLVE;
+
+        off++;
     }
+
+    char ** domains = &argv[off];
+    if (domains == 0)
+        usage(argv[0]);
 
     DNSResolverIface *dns;
     if ((dns = createResolver(NULL, 10)) == NULL) {
@@ -792,7 +821,7 @@ int main(int argc, char *argv[]) {
     do {
         while (*domains != 0 && inflight < 100) {
             stillrunning.insert(*domains);
-            dns->resolve(NULL, *domains++, qtype, callback);
+            dns->resolve(*domains++, qtype, callback, NULL, options);
             inflight++;
         }
 

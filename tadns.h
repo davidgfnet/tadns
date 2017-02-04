@@ -53,7 +53,8 @@ enum dns_error {
     DNS_OK,             /* No error                     */
     DNS_DOES_NOT_EXIST, /* Error: adress does not exist */
     DNS_TIMEOUT,        /* Lookup time expired          */
-    DNS_ERROR           /* No memory or other error     */
+    DNS_ERROR,          /* No memory or other error     */
+    DNS_NET_ERROR       /* Network error                */
 };
 
 struct dns_record {
@@ -75,7 +76,10 @@ typedef void (*dns_callback_t)(struct dns_cb_data *);
 
 #define    DNS_QUERY_MAXITER   16   /* Query max iterations */
 
-//#define DO_DNS_PREFETCH              /* Do prefetch when more than one server is available */
+#define    DNS_OPT_ITERATIVE_SOLVE   0x0000  /* Use iterative solving */
+#define    DNS_OPT_RECURSIVE_SOLVE   0x0001  /* Use recursive solving */
+
+#define    DO_DNS_PREFETCH      2   /* Do prefetch when more than one server is available (up to level N) */
 
 //#define TADNS_DONT_USE_OS_DNS_SERVERS  /* Use OS's DNS servers facilities */
 
@@ -88,7 +92,7 @@ public:
     virtual ~DNSResolverIface() {}
 
     virtual std::pair<int,int> getFds() const = 0;
-    virtual void resolve(void *context, std::string host, enum dns_record_type type, dns_callback_t callback) = 0;
+    virtual void resolve(std::string host, enum dns_record_type type, dns_callback_t callback, void *context, unsigned options) = 0;
     virtual void cancel(const void *context) = 0;
     virtual int poll() = 0;
     virtual unsigned ongoingReqs() = 0;
