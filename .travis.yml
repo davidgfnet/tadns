@@ -7,5 +7,5 @@ compiler:
 before_script:
   - sudo apt-get update -qq
 
-script: make
+script: make all
 
