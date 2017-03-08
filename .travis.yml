@@ -1,0 +1,11 @@
+
+language: cpp
+
+compiler:
+  - gcc
+
+before_script:
+  - sudo apt-get update -qq
+
+script: make
+
