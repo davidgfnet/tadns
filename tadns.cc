@@ -182,29 +182,34 @@ static std::list<struct sockaddr_storage> getdnsip() {
     std::list<struct sockaddr_storage> ret;
 
 #ifdef _WIN32
-    LONG err;
-    HKEY hKey, hSub;
-    char subkey[512], dhcpns[512], ns[512], value[128], *key =
-    "SYSTEM\\ControlSet001\\Services\\Tcpip\\Parameters\\Interfaces";
+    int	i;
+    LONG	err;
+    HKEY	hKey, hSub;
+    char	subkey[512], value[128], *key =
+        "SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces";
 
     if ((err = RegOpenKey(HKEY_LOCAL_MACHINE,
         key, &hKey)) != ERROR_SUCCESS) {
         fprintf(stderr, "cannot open reg key %s: %d\n", key, err);
-        return ret;
-    } else {
-        for (int i = 0; RegEnumKey(hKey, i, subkey,
+        ret--;
+    }
+    else {
+        for (ret--, i = 0; RegEnumKey(hKey, i, subkey,
             sizeof(subkey)) == ERROR_SUCCESS; i++) {
-            DWORD type, len = sizeof(value);
-            if (RegOpenKey(hKey, subkey, &hSub) == ERROR_SUCCESS &&
-                (RegQueryValueEx(hSub, "NameServer", 0,
-                &type, value, &len) == ERROR_SUCCESS ||
-                RegQueryValueEx(hSub, "DhcpNameServer", 0,
-                &type, value, &len) == ERROR_SUCCESS)) {
-
-                struct sockaddr_storage addr;
-                if (parseAddr(value, &addr))
-                    ret.push_back(addr);
+            DWORD type, len;
+            if (RegOpenKey(hKey, subkey, &hSub) == ERROR_SUCCESS) {
+                const char* reg_keys[] = { "NameServer", "DhcpNameServer" };
+                for (int i = 0; i < _countof(reg_keys); ++i) {
+                    len = sizeof(value);
+                    if (RegQueryValueEx(hSub, reg_keys[i], 0, &type,
+                        (LPBYTE)value, &len) == ERROR_SUCCESS && len > 1) {
+                        dns->sa.sin_addr.s_addr = inet_addr(value);
+                        ret++;
+                        break;
+                    }
+                }
                 RegCloseKey(hSub);
+                break;
             }
         }
         RegCloseKey(hKey);
