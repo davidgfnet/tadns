@@ -1,11 +1,15 @@
 
+CXX=g++
+CFLAGS=-O2 -ggdb -Wall
+CXXFLAGS=$(CFLAGS)
+
 all:	tadns-dig tadns-server
 
 tadns-dig:
-	g++ -o tadns-dig tadns.cc tadns_common.cc -DADIG -O2 -ggdb -Wall
+	$(CXX) -o tadns-dig tadns.cc tadns_common.cc -DADIG $(CXXFLAGS)
 
 tadns-server:
-	g++ -o tadns-server tadns-server.cc tadns.cc tadns_common.cc -O2 -ggdb -Wall
+	$(CXX)-o tadns-server tadns-server.cc tadns.cc tadns_common.cc $(CXXFLAGS)
 
 clean:
 	rm -f tadns-dig tadns-server
