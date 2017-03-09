@@ -22,13 +22,17 @@
 #include <list>
 #include <string>
 #include <limits>
-#include <arpa/inet.h>
 #include <iostream>
+#include <memory>
 
 #ifdef _WIN32
 #pragma comment(lib,"ws2_32")
 #pragma comment(lib,"advapi32")
-#include <winsock.h>
+#pragma comment(lib, "iphlpapi.lib")
+#include <WinSock2.h>
+#include <Ws2tcpip.h>
+#include <Ws2ipdef.h>
+#include <iphlpapi.h>
 typedef int socklen_t;
 typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
@@ -40,14 +44,15 @@ typedef unsigned int uint32_t;
 #include <sys/select.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 #endif /* _WIN32 */
 
 #include "tadns.h"
 #include "tadns_common.h"
 
 #define MIN_TTL_TIME            60  /* Minimum TTL time (secs)   */
-#define MAX_CACHE_ENTRIES   (1<<16) /* Dont cache more than that */
-#define CACHE_PURGE_STEP    (1<<14) /* Dont cache more than that */
+#define MAX_CACHE_ENTRIES   (1<<16) /* Don't cache more than that */
+#define CACHE_PURGE_STEP    (1<<14) /* Don't cache more than that */
 
 /*
  * User query. Holds mapping from application-level ID to DNS transaction id,
@@ -62,18 +67,19 @@ public:
         if (deps_on)
             deps_on->deps.erase(this);
 
-        for (auto e: deps)
-            delete e;
+        for (auto e = deps.begin(); e != deps.end();) {
+            e = deps.erase(e);
+        }
     }
 
-    time_t atimeout;         /* Activity timeout for the query */
-    unsigned niter;          /* Number of iterations to resolve this */
-    uint16_t qtype;          /* Query type */
-    std::string name;        /* Host name */
-    void *ctx;               /* Application context */
-    dns_callback_t callback; /* User callback routine */
-    std::set<Query*> deps;   /* Dependant queries */
-    Query* deps_on;          /* Query we wait on */
+    time_t atimeout;                            /* Activity timeout for the query */
+    unsigned niter;                             /* Number of iterations to resolve this */
+    uint16_t qtype;                             /* Query type */
+    std::string name;                           /* Host name */
+    void *ctx;                                  /* Application context */
+    dns_callback_t callback;                    /* User callback routine */
+    std::set<Query *> deps;                     /* Dependent queries */
+    Query * deps_on;                            /* Query we wait on */
 };
 
 struct cache_entry {
@@ -109,9 +115,6 @@ public:
             (void) closesocket(sock4);
         if (sock6 != -1)
             (void) closesocket(sock6);
-
-        for (auto it: active)
-            delete it.second;
     }
 
     std::pair<int,int> getFds() const { return std::make_pair(sock4, sock6); }
@@ -125,15 +128,16 @@ protected:
     void parse_udp(const unsigned char *pkt, int len);
     void purgeCache();
     struct sockaddr *getNextServer();
-    void queue(unsigned niter, std::string name, Query *dep, enum dns_record_type qtype, struct sockaddr * dnss);
-    void send_dns_packet(Query *query, struct sockaddr * dnss);
-    Query *createQuery(unsigned niter, void *ctx, std::string name, enum dns_record_type qtype, dns_callback_t callback);
+    void queue(unsigned niter, std::string name, std::shared_ptr<Query> dep, enum dns_record_type qtype, 
+            struct sockaddr * dnss, void *ctx, dns_callback_t callback);
+    void send_dns_packet(std::shared_ptr<Query> query, struct sockaddr * dnss);
+    std::shared_ptr<Query> createQuery(unsigned niter, void *ctx, std::string name, enum dns_record_type qtype, dns_callback_t callback);
     std::string getNSipaddr(unsigned level, unsigned niter, std::vector<struct dns_record> recs, std::string dom,
             void *ctx, std::string name, enum dns_record_type qtype, dns_callback_t callback);
     void resolveInt(unsigned niter, void *context, std::string host, enum dns_record_type type, dns_callback_t callback);
     void call_user_rec(Query *q, enum dns_error err);
 
-    Query * find_active_query(uint16_t tid) const { return active.count(tid) ? active.at(tid) : NULL; }
+    std::shared_ptr<Query> find_active_query(uint16_t tid) const;
     uint16_t getNewTid();
 
     /* UDP sockets used for queries */
@@ -144,8 +148,8 @@ protected:
     /* Available DNS servers */
     std::list<struct sockaddr_storage> dns_servers;
     /* Active queries */
-    std::unordered_map<uint16_t, Query*> active;
-    std::map< std::pair<std::string, uint16_t>, Query*> ongoing;
+    std::unordered_map<uint16_t, std::shared_ptr<Query> > active;
+    std::map< std::pair<std::string, uint16_t>, std::shared_ptr<Query> > ongoing;
     /* Cached queries */
     std::map< std::pair<std::string, uint16_t>, cache_entry> cached; 
     /* Timeouts */
@@ -182,33 +186,46 @@ static std::list<struct sockaddr_storage> getdnsip() {
     std::list<struct sockaddr_storage> ret;
 
 #ifdef _WIN32
-    LONG err;
-    HKEY hKey, hSub;
-    char subkey[512], dhcpns[512], ns[512], value[128], *key =
-    "SYSTEM\\ControlSet001\\Services\\Tcpip\\Parameters\\Interfaces";
 
-    if ((err = RegOpenKey(HKEY_LOCAL_MACHINE,
-        key, &hKey)) != ERROR_SUCCESS) {
-        fprintf(stderr, "cannot open reg key %s: %d\n", key, err);
-        return ret;
-    } else {
-        for (int i = 0; RegEnumKey(hKey, i, subkey,
-            sizeof(subkey)) == ERROR_SUCCESS; i++) {
-            DWORD type, len = sizeof(value);
-            if (RegOpenKey(hKey, subkey, &hSub) == ERROR_SUCCESS &&
-                (RegQueryValueEx(hSub, "NameServer", 0,
-                &type, value, &len) == ERROR_SUCCESS ||
-                RegQueryValueEx(hSub, "DhcpNameServer", 0,
-                &type, value, &len) == ERROR_SUCCESS)) {
+    // Make an initial call to GetAdaptersInfo to get
+    // the necessary size
+    ULONG ulOutBufLen = sizeof(FIXED_INFO);
+    std::vector<char> vBuffer(ulOutBufLen, 0);
+    IP_ADDR_STRING *pIPAddr = 0;
+    DWORD res = GetNetworkParams((FIXED_INFO *)vBuffer.data(), &ulOutBufLen);
+    if (res == ERROR_BUFFER_OVERFLOW) {
 
-                struct sockaddr_storage addr;
-                if (parseAddr(value, &addr))
-                    ret.push_back(addr);
-                RegCloseKey(hSub);
-            }
-        }
-        RegCloseKey(hKey);
+        // Not enough space in buffer, resize memory
+        vBuffer.resize(ulOutBufLen);
     }
+
+    // Get real network parameters
+    res = GetNetworkParams((FIXED_INFO *)vBuffer.data(), &ulOutBufLen);
+    if (res == NO_ERROR) {
+
+        // Browse all server list
+        FIXED_INFO *pIPAddr = (FIXED_INFO *)vBuffer.data();
+        IP_ADDR_STRING* pAddr = &pIPAddr->DnsServerList;
+        while (pAddr != 0) {
+
+            // Parse this address and add it to the server's collection
+            struct sockaddr_storage addr;
+            if (parseAddr(pAddr->IpAddress.String, &addr)) {
+                ret.push_back(addr);
+            }
+
+            // Go to next dns server
+            pAddr = pAddr->Next;
+
+            // FIXME: Keep only the first entry
+            // Find a way to filter the virtual interface as VMWare, VirtualBox
+            // as they will inject bad DNS server that will not respond
+            // On Windows the request will be sent through sendto without error but
+            // we will get a WSAECONNRESET from recvfrom call.
+            break;
+        }
+    }
+
 #else
     FILE *fp;
     char line[512];
@@ -287,7 +304,6 @@ void DNSResolver::cancel(const void *context) {
     for (auto it: active) {
         if (it.second->ctx == context) {
             ongoing.erase(std::make_pair(it.second->name, it.second->qtype));
-            delete it.second;
             active.erase(it.first);
             assert(active.size() == ongoing.size());
             return;
@@ -338,7 +354,7 @@ void DNSResolver::purgeCache() {
 }
 
 void DNSResolver::parse_udp(const unsigned char *pkt, int len) {
-    Query *q;
+    std::shared_ptr<Query> q;
     struct header *header = (struct header *) pkt;
 
     /* Return if we did not send that query */
@@ -351,32 +367,32 @@ void DNSResolver::parse_udp(const unsigned char *pkt, int len) {
     std::vector< std::tuple<unsigned, void*, std::string, enum dns_record_type, dns_callback_t> > deferred;
     if (ntohs(header->nqueries) != 1)
         /* We sent 1 query. We want to see more that 1 answer. */
-        call_user_rec(q, DNS_ERROR);
+        call_user_rec(q.get(), DNS_ERROR);
     else if ((header->nanswers | header->nauth | header->nother) == 0)
         /* Received 0 answers */
-        call_user_rec(q, DNS_DOES_NOT_EXIST);
+        call_user_rec(q.get(), DNS_DOES_NOT_EXIST);
     else if (dnsp.questions.size() == 0 || dnsp.questions[0].name != q->name)
         /* Check whether the query matches at all! */
-        call_user_rec(q, DNS_ERROR);
+        call_user_rec(q.get(), DNS_ERROR);
     else {
         struct cache_entry entry;
         entry.hits = 0;
-        entry.expire = std::numeric_limits<time_t>::max();
+        entry.expire = (std::numeric_limits<time_t>::max)();
         entry.replies = dnsp.answers;
 
         for (const auto &e: dnsp.answers)
-            entry.expire = std::min(time(NULL) + (time_t)e.ttl, entry.expire);
+            entry.expire = (std::min)(time(NULL) + (time_t)e.ttl, entry.expire);
 
         // Detected some 0 TTL answers, that's an issue cause we rely on the cache as an intermediate
         // structure. That works as long as ttls are significantly bigger than DNS response latency
-        entry.expire = std::max(time(NULL) + MIN_TTL_TIME, entry.expire);
+        entry.expire = (std::max)(time(NULL) + MIN_TTL_TIME, entry.expire);
 
         // Insert finding in the cache
         auto cacheentry = std::make_pair(q->name, q->qtype);
         cached.erase(cacheentry);
         auto res = cached.emplace(cacheentry, entry);
 
-        /* If query has a dependant, do not notify the user but re-schedule it */
+        /* If query has a dependent, do not notify the user but re-schedule it */
         if (q->deps.size())
             for (auto de: q->deps)
                 deferred.push_back(std::make_tuple(q->niter, de->ctx, de->name, (enum dns_record_type)de->qtype, de->callback));
@@ -388,9 +404,6 @@ void DNSResolver::parse_udp(const unsigned char *pkt, int len) {
     active.erase(dnsp.header.tid);
     ongoing.erase(std::make_pair(q->name, q->qtype));
     assert(active.size() == ongoing.size());
-
-    // Remove the query from the deps list
-    delete q;
 
     // Retry deferred queries
     for (auto df: deferred)
@@ -407,6 +420,11 @@ void DNSResolver::call_user_rec(Query *q, enum dns_error err) {
     call_user(this, q->name, q->qtype, NULL, q->callback, q->ctx, err);
 }
 
+std::shared_ptr<Query> DNSResolver::find_active_query(uint16_t tid) const { 
+
+    return active.count(tid) ? active.at(tid) : NULL; 
+}
+
 int DNSResolver::poll() {
     struct sockaddr_in sa;
     socklen_t len = sizeof(sa);
@@ -417,13 +435,13 @@ int DNSResolver::poll() {
     now = time(NULL);
 
     /* Check our sockets for new stuff */
-    while ((n = recvfrom(sock4, pkt, sizeof(pkt), 0,
+    while ((n = recvfrom(sock4, (char *)pkt, sizeof(pkt), 0,
         (struct sockaddr *) &sa, &len)) > 0 &&
         n > (int) sizeof(struct header)) {
         this->parse_udp(pkt, n);
         num_packets++;
     }
-    while ((n = recvfrom(sock6, pkt, sizeof(pkt), 0,
+    while ((n = recvfrom(sock6, (char *)pkt, sizeof(pkt), 0,
         (struct sockaddr *) &sa, &len)) > 0 &&
         n > (int) sizeof(struct header)) {
         this->parse_udp(pkt, n);
@@ -434,10 +452,9 @@ int DNSResolver::poll() {
     auto ita = active.begin();
     while (ita != active.end()) {
         if (ita->second->atimeout < now) {
-            call_user_rec(ita->second, DNS_TIMEOUT);
+            call_user_rec(ita->second.get(), DNS_TIMEOUT);
 
             ongoing.erase(std::make_pair(ita->second->name, ita->second->qtype));
-            delete ita->second;
             ita = active.erase(ita);
             assert(active.size() == ongoing.size());
         }
@@ -528,13 +545,13 @@ DNSResolver::getNSipaddr(unsigned level, unsigned niter, std::vector<struct dns_
     #ifdef DO_DNS_PREFETCH
     if (level <= DO_DNS_PREFETCH) {
         for (const auto & e: nsrecs)
-            this->queue(niter, e, NULL, DNS_A_RECORD, NULL);
+            this->queue(niter, e, NULL, DNS_A_RECORD, NULL, ctx, callback);
     }
     #endif
 
     if (totry >= 0) {
-        Query * oq = createQuery(niter, ctx, name, qtype, callback);
-        this->queue(niter, nsrecs[totry], oq, DNS_A_RECORD, NULL);
+        std::shared_ptr<Query> oq = createQuery(niter, ctx, name, qtype, callback);
+        this->queue(niter, nsrecs[totry], oq, DNS_A_RECORD, NULL, ctx, callback);
         return "";
     }
     else {
@@ -547,8 +564,8 @@ DNSResolver::getNSipaddr(unsigned level, unsigned niter, std::vector<struct dns_
 void DNSResolver::resolve(std::string name, enum dns_record_type qtype,
                           dns_callback_t callback, void *ctx, unsigned options) {
     if (options & DNS_OPT_RECURSIVE_SOLVE) {
-        Query * oq = createQuery(0, ctx, name, qtype, callback);
-        this->queue(0, name, oq, qtype, NULL);
+        std::shared_ptr<Query> oq = createQuery(0, ctx, name, qtype, callback);
+        this->queue(0, name, oq, qtype, NULL, ctx, callback);
     } else {
         this->resolveInt(0, ctx, name, qtype, callback);
     }
@@ -612,8 +629,8 @@ void DNSResolver::resolveInt(unsigned niter, void *ctx, std::string name,
             }
         } else {
             // We don't have the NS for that record, ask for it (cache miss)
-            Query * oq = createQuery(niter, ctx, name, qtype, callback);
-            this->queue(niter, part, oq, iqtype, dnss);
+            std::shared_ptr<Query> oq = createQuery(niter, ctx, name, qtype, callback);
+            this->queue(niter, part, oq, iqtype, dnss, ctx, callback);
             return; // Will come back here eventually :D
         }
 
@@ -621,13 +638,13 @@ void DNSResolver::resolveInt(unsigned niter, void *ctx, std::string name,
     }
 }
 
-Query * DNSResolver::createQuery(unsigned niter, void *ctx, std::string name,
-                    enum dns_record_type qtype, dns_callback_t callback) {
+std::shared_ptr<Query> DNSResolver::createQuery(unsigned niter, void *ctx, std::string name,
+                        enum dns_record_type qtype, dns_callback_t callback) {
 
     std::transform(name.begin(), name.end(), name.begin(), ::tolower);
 
     time_t now = time(NULL);
-    Query * query = new Query();
+    std::shared_ptr<Query> query = std::shared_ptr<Query>(new Query());
     query->ctx = ctx;
     query->qtype = (uint16_t) qtype;
     query->callback = callback;
@@ -648,7 +665,8 @@ uint16_t DNSResolver::getNewTid() {
 }
 
 // Precondition, a query with dep!=0 cannot have a cache hit (check before queuing)
-void DNSResolver::queue(unsigned niter, std::string name, Query *dep, enum dns_record_type qtype, struct sockaddr * dnss) {
+void DNSResolver::queue(unsigned niter, std::string name, std::shared_ptr<Query> dep, 
+    enum dns_record_type qtype, struct sockaddr * dnss, void *ctx, dns_callback_t callback) {
     struct cache_entry * centry;
     struct dns_cb_data cbd;
 
@@ -656,35 +674,30 @@ void DNSResolver::queue(unsigned niter, std::string name, Query *dep, enum dns_r
 
     /* Search the cache first */
     if ((centry = find_cached_query(qtype, name)) != NULL) {
-        assert(dep == NULL);
+        assert(dep->deps.size() == 0);
+        call_user(this, name, qtype, centry, callback, ctx, DNS_OK);
         return;
     }
 
     /* Check ongoing requests */
-    // Dependants get merged and will be waken all together
+    // Dependents get merged and will be waken all together
     // if there is no callback to the user, safe to ignore it
     auto lookup = std::make_pair(name, qtype);
     auto existingq = ongoing.find(lookup);
     if (existingq != ongoing.end()) {
         if (dep) {
-            existingq->second->deps.insert(dep);
-            dep->deps_on = existingq->second;
+            existingq->second->deps.insert(dep.get());
+            dep->deps_on = existingq->second.get();
         }
         return;
     }
 
-    /* Allocate new query */
-    Query * query = createQuery(niter, NULL, name, qtype, NULL);
-    if (dep) {
-        query->deps.insert(dep);
-        dep->deps_on = query;
-    }
-
-    send_dns_packet(query, dnss);
+    /* Send new query */
+    send_dns_packet(dep, dnss);
 }
 
 
-void DNSResolver::send_dns_packet(Query *query, struct sockaddr * dnss) {
+void DNSResolver::send_dns_packet(std::shared_ptr<Query> query, struct sockaddr * dnss) {
     struct dns_packet outp;
 
     /* Prepare DNS packet header */
@@ -705,7 +718,7 @@ void DNSResolver::send_dns_packet(Query *query, struct sockaddr * dnss) {
     unsigned psize = serialize_udp_packet(&outp, pkt);
     assert(psize < sizeof(pkt));
 
-    /* FIXME Add some queueing mechanism for packets? */
+    /* FIXME Add some queuing mechanism for packets? */
     if (dnss)
         pkts_auth_servers++;
     else
@@ -716,12 +729,11 @@ void DNSResolver::send_dns_packet(Query *query, struct sockaddr * dnss) {
     int ssock = serv->sa_family == AF_INET ? sock4 : sock6;
     int addrl = serv->sa_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
 
-    if (sendto(ssock, pkt, psize, 0, serv, addrl) != psize) {
-        call_user_rec(query, DNS_NET_ERROR);
-        delete query;
+    if (sendto(ssock, (char *)pkt, psize, 0, serv, addrl) != psize) {
+        call_user_rec(query.get(), DNS_NET_ERROR);
     } else {
         auto lookup = std::make_pair(query->name, query->qtype);
-        active.emplace(outp.header.tid, query);
+        active[outp.header.tid] = query;
         ongoing[lookup] = query;
         assert(active.size() == ongoing.size());
     }

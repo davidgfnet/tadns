@@ -1,8 +1,13 @@
 
 #include <algorithm>
-#include <netinet/in.h>
+#if _WIN32
+    #include <Winsock2.h>
+#else
+    #include <netinet/in.h>
+#endif
 #include <string.h>
 #include <fcntl.h>
+#include <stdint.h>
 
 #include "tadns_common.h"
 
@@ -27,7 +32,7 @@ unsigned fetch(const uint8_t *pkt, const uint8_t *s, int pktsiz, char *dst, int 
             labelj = true;
         } else {
             if (!labelj)
-                skip += std::min(n, dstlen - i) + 1;
+                skip += (std::min)(n, dstlen - i) + 1;
             for (j = 0; j < n && i < dstlen; j++)
                 dst[i++] = *s++;
         }

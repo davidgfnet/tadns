@@ -16,7 +16,14 @@ struct header {
     uint16_t nanswers;  /* Answers               */
     uint16_t nauth;     /* Authority PRs         */
     uint16_t nother;    /* Other PRs             */
-    uint8_t  data[];    /* Data, variable length */
+#if _WIN32
+    #pragma warning( push )
+    #pragma warning(disable : 4200) 
+#endif    
+    uint8_t  data[0];    /* Data, variable length */
+#if _WIN32
+    #pragma warning( pop )
+#endif
 };
 
 struct dns_question {
@@ -25,9 +32,13 @@ struct dns_question {
 };
 
 struct dns_packet {
-    struct header header;
     std::vector<struct dns_question> questions;
     std::vector<struct dns_record> answers;
+    
+    // Header should appears on the last member
+    // Visual Studio Error : Compiler Error C2229
+    // Ref : https://msdn.microsoft.com/en-us/library/0scy7z2d.aspx
+    struct header header;
 };
 
 
