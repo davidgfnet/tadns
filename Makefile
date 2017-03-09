@@ -1,7 +1,7 @@
 
-CXX=g++
-CFLAGS=-O2 -ggdb -Wall
-CXXFLAGS=$(CFLAGS)
+CXX ?= g++
+CFLAGS ?= -O2 -ggdb -Wall
+CXXFLAGS ?= $(CFLAGS)
 
 all:	tadns-dig tadns-server
 

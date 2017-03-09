@@ -17,6 +17,6 @@ matrix:
       compiler: gcc
 
 script:
-  CXX=g++-6 make all
+  make all
 
 
