@@ -51,7 +51,7 @@ enum dns_response_type {
 
 enum dns_error {
     DNS_OK,             /* No error                     */
-    DNS_DOES_NOT_EXIST, /* Error: adress does not exist */
+    DNS_DOES_NOT_EXIST, /* Error: address does not exist */
     DNS_TIMEOUT,        /* Lookup time expired          */
     DNS_ERROR,          /* No memory or other error     */
     DNS_NET_ERROR       /* Network error                */
