@@ -546,9 +546,16 @@ DNSResolver::getNSipaddr(unsigned level, unsigned niter, std::vector<struct dns_
 
 void DNSResolver::resolve(std::string name, enum dns_record_type qtype,
                           dns_callback_t callback, void *ctx, unsigned options) {
+    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+
     if (options & DNS_OPT_RECURSIVE_SOLVE) {
-        Query * oq = createQuery(0, ctx, name, qtype, callback);
-        this->queue(0, name, oq, qtype, NULL);
+		struct cache_entry *dentry = find_cached_query(qtype, name);
+		if (dentry) {
+		    call_user(this, name, qtype, dentry, callback, ctx, DNS_OK);
+		} else {
+	        Query * oq = createQuery(0, ctx, name, qtype, callback);
+    	    this->queue(0, name, oq, qtype, NULL);
+		}
     } else {
         this->resolveInt(0, ctx, name, qtype, callback);
     }
