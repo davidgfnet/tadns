@@ -62,8 +62,14 @@ public:
         if (deps_on)
             deps_on->deps.erase(this);
 
-        for (auto e: deps)
-            delete e;
+        // We have to be careful here, deleting a child Query results in it
+        // erasing itself from the deps set invalidating the iterator
+        // so take a copy and increment the iterator before deleting.
+        for (std::set<Query*>::iterator it = deps.begin(); it != deps.end();) {
+            auto temp = *it;
+            it++;
+            delete temp;
+        }
     }
 
     time_t atimeout;         /* Activity timeout for the query */
@@ -147,7 +153,7 @@ protected:
     std::unordered_map<uint16_t, Query*> active;
     std::map< std::pair<std::string, uint16_t>, Query*> ongoing;
     /* Cached queries */
-    std::map< std::pair<std::string, uint16_t>, cache_entry> cached; 
+    std::map< std::pair<std::string, uint16_t>, cache_entry> cached;
     /* Timeouts */
     unsigned atimeout;
 };
@@ -296,7 +302,7 @@ void DNSResolver::cancel(const void *context) {
 }
 
 static void
-call_user(DNSResolver *dns, std::string name, uint16_t qtype, 
+call_user(DNSResolver *dns, std::string name, uint16_t qtype,
           const struct cache_entry *entry, dns_callback_t cb, void *ctx, enum dns_error error)
 {
     struct dns_cb_data cbd;
